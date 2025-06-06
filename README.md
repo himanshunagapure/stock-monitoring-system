@@ -1,0 +1,1 @@
+Stock Monitoring System Using Agentic AI
