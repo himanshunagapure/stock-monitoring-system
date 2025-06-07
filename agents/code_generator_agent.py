@@ -4,7 +4,8 @@ import json
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 from api_key_config import API_KEY_MAPPING
 
@@ -146,16 +147,15 @@ Be strict - if the request cannot be properly fulfilled with available free APIs
 """
         
         try:
-            response = self.model.generate_content(
-                analysis_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=1000,
-                    temperature=0.1,
-                )
-            )
+            messages = [
+                SystemMessage(content="You are a financial API analysis expert. Analyze the request and respond in the exact JSON format specified."),
+                HumanMessage(content=analysis_prompt)
+            ]
+            
+            response = self.model.invoke(messages)
+            response_text = response.content
             
             # Extract JSON from response
-            response_text = response.text
             if "```json" in response_text:
                 json_part = response_text.split("```json")[1].split("```")[0].strip()
             elif "```" in response_text:
@@ -183,8 +183,12 @@ class CodeGeneratorAgent:
         if not os.getenv('GOOGLE_API_KEY'):
             raise Exception("GOOGLE_API_KEY is required for the Code Generator Agent to function.")
         
-        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        self.model = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            temperature=0.1,
+            google_api_key=os.getenv('GOOGLE_API_KEY'),
+            convert_system_message_to_human=True
+        )
         
         # Initialize validators
         self.validator = RequestValidator()
@@ -456,15 +460,13 @@ Format as complete Python code with imports and example usage.
 """
         
         try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=3000,
-                    temperature=0.1,
-                )
-            )
+            messages = [
+                SystemMessage(content="You are a financial tool code generator. Generate code that strictly follows the requirements and never simulates data."),
+                HumanMessage(content=prompt)
+            ]
             
-            generated_code = response.text
+            response = self.model.invoke(messages)
+            generated_code = response.content
             
             # Clean up the code
             if "```python" in generated_code:

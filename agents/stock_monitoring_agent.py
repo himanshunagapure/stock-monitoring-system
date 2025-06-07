@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Literal
 from dataclasses import dataclass, asdict
 import yfinance as yf
-#import google.generativeai as genai
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import Tool
