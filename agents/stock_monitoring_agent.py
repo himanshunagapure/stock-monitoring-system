@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Literal
 from dataclasses import dataclass, asdict
 import yfinance as yf
+import importlib.util
+import sys
+from pathlib import Path
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import Tool
@@ -16,10 +20,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict, Annotated
 
-from tools.fetch_price import fetch_stock_price
+from tools.get_stock_price import fetch_stock_price
 from tools.check_condition import check_condition
-from tools.notify import send_email_alert
-from tools.get_ceo import get_company_ceo
+from tools.request_email_alert import send_email_alert
+from tools.get_company_ceo import get_company_ceo
 from tools.get_company_financials import get_company_financials
 
 # ✅ Configure Gemini
@@ -75,9 +79,10 @@ class SessionManager:
         self._sessions: Dict[str, UserSession] = {}
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
     
-    def create_session(self, user_id: Optional[str] = None) -> str:
-        """Create a new session"""
-        session_id = str(uuid.uuid4())
+    def create_session(self, session_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
+        """Create a new session (with optional custom session_id)"""
+        if not session_id:
+            session_id = str(uuid.uuid4()) # for testing of file individually
         now = datetime.now()
         
         session = UserSession(
@@ -92,9 +97,12 @@ class SessionManager:
         return session_id
     
     def get_session(self, session_id: str) -> Optional[UserSession]:
-        """Get session and update last activity"""
+        """Get session and update last activity. Create if not exists."""
         session = self._sessions.get(session_id)
-        if session:
+        if not session:
+            self.create_session(session_id=session_id)
+            session = self._sessions[session_id]
+        else:
             session.last_activity = datetime.now()
         return session
     
@@ -267,11 +275,78 @@ def get_financials_tool(symbol: str) -> str:
     except Exception as e:
         return f"❌ Error getting financials for {symbol}: {str(e)}"
 
+#Add dynamic tools to list of tools
+def load_dynamic_tools() -> List[Tool]:
+    """Load dynamic tools from tool_registry.json"""
+    dynamic_tools = []
+    
+    try:
+        # Load tool registry
+        registry_path = Path("tool_registry.json")
+        if not registry_path.exists():
+            print("⚠️ tool_registry.json not found, skipping dynamic tools")
+            return dynamic_tools
+        
+        with open(registry_path, 'r') as f:
+            registry = json.load(f)
+        
+        for tool_info in registry.get('tools', []):
+            try:
+                # Import the dynamic tool module
+                tool_path = Path(tool_info['filepath'])
+                if not tool_path.exists():
+                    print(f"⚠️ Tool file not found: {tool_path}")
+                    continue
+                
+                # Load module dynamically
+                spec = importlib.util.spec_from_file_location(
+                    tool_info['name'], 
+                    tool_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[tool_info['name']] = module
+                spec.loader.exec_module(module)
+                
+                # Look for main function (usually the tool name or 'main')
+                main_func = None
+                possible_func_names = [
+                    tool_info['name'],
+                    'main',
+                    'execute',
+                    'run'
+                ]
+                
+                for func_name in possible_func_names:
+                    if hasattr(module, func_name):
+                        main_func = getattr(module, func_name)
+                        break
+                
+                if main_func:
+                    # Create Tool wrapper
+                    tool = Tool(
+                        name=tool_info['name'],
+                        func=main_func,
+                        description=tool_info['description']
+                    )
+                    dynamic_tools.append(tool)
+                    print(f"✅ Loaded dynamic tool: {tool_info['name']}")
+                else:
+                    print(f"⚠️ No main function found for tool: {tool_info['name']}")
+                    
+            except Exception as e:
+                print(f"❌ Error loading tool {tool_info['name']}: {str(e)}")
+                continue
+    
+    except Exception as e:
+        print(f"❌ Error loading tool registry: {str(e)}")
+    
+    return dynamic_tools
+
 # ✅ LangGraph Tools with Session Context
 def create_session_aware_tools(session_id: str) -> List[Tool]:
     """Create tools that are aware of the current session"""
-    
-    return [
+    # Static/built-in tools
+    static_tools = [
         Tool(
             name="get_stock_price",
             func=lambda symbol: get_stock_price_tool(symbol, session_id),
@@ -302,6 +377,17 @@ def create_session_aware_tools(session_id: str) -> List[Tool]:
             description="Get company financial data. Input: stock symbol"
         )
     ]
+    
+    # Load dynamic tools
+    dynamic_tools = load_dynamic_tools()
+    
+    # Combine static and dynamic tools
+    all_tools = static_tools + dynamic_tools
+    
+    print(f"📊 Total tools loaded: {len(all_tools)} (Static: {len(static_tools)}, Dynamic: {len(dynamic_tools)})")
+    
+    return all_tools
+    
 
 # ✅ LangGraph Nodes
 def agent_node(state: AgentState):
@@ -311,10 +397,12 @@ def agent_node(state: AgentState):
     
     # Create session-aware tools
     tools = create_session_aware_tools(session_id)
-    tool_node = ToolNode(tools)
+    
+    # Get tool names for system message
+    tool_names = [tool.name for tool in tools]
     
     # System message with instructions
-    system_msg = SystemMessage(content="""You are an intelligent stock monitoring assistant.
+    system_msg = SystemMessage(content=f"""You are an intelligent stock monitoring assistant.
 
 CAPABILITIES:
 - Get real-time stock prices
@@ -323,23 +411,34 @@ CAPABILITIES:
 - Get company CEO information
 - Get company financial data
 
+AUTONOMOUS OPERATION GUIDELINES:
+- Analyze the user's request carefully to understand their true intent
+- Keywords like "monitor", "watch", "track", "alert", "notify" all require getting stock price first
+- Review all available tools and determine which ones are relevant
+- Design your own workflow to accomplish the user's goals most effectively
+- You have complete freedom to decide the sequence and combination of tools to us
+- Adapt your approach based on what the user is asking for
+- Think creatively about how to combine tools for complex requests
+Only use tools that are actually needed - don't use unnecessary tools
+
 WORKFLOW GUIDELINES:
 1. Understand the user's request completely
-2. Use tools strategically to gather needed information
-3. For email alerts, use 'request_email_alert' tool - this will create a pending request
-4. Be clear about what actions require confirmation
-5. Provide comprehensive responses with all requested information
+2. For ANY stock-related request, START with get_stock_price
+3. Use tools strategically to gather needed information
+4. For email alerts, use 'request_email_alert' tool - this will create a pending request
+5. Be clear about what actions require confirmation
+6. Provide comprehensive responses with all requested information
 
 IMPORTANT: Email alerts require user confirmation and will be handled separately.
 
-Available tools: get_stock_price, check_condition, request_email_alert, get_company_ceo, get_company_financials
+Available tools: {', '.join(tool_names)}
 """)
     
     # Bind tools to LLM
     llm_with_tools = llm.bind_tools(tools)
-    
     # Get response from LLM
     response = llm_with_tools.invoke([system_msg] + messages)
+    print("\n🌟🌟🌟 response = ", response)
     
     # Check if tools need to be called
     if response.tool_calls:
@@ -348,7 +447,7 @@ Available tools: get_stock_price, check_condition, request_email_alert, get_comp
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
-            
+            print(f'\n 🌟🌟🌟 Tool call = {tool_call}, tool name = {tool_name} and tool_args = {tool_args}')
             # Find and execute the tool
             for tool in tools:
                 if tool.name == tool_name:
@@ -357,9 +456,11 @@ Available tools: get_stock_price, check_condition, request_email_alert, get_comp
                             # Single argument
                             arg_value = list(tool_args.values())[0]
                             result = tool.func(arg_value)
+                            print(f'\n 🌟 if part : Tool Name = {tool_name}, tool args = {arg_value}, function result = {result}')
                         else:
                             # Multiple arguments or direct call
                             result = tool.func(**tool_args if isinstance(tool_args, dict) else tool_args)
+                            print(f'\n 🌟 else part: Tool Name = {tool_name}, tool args = {arg_value}, function result = {result}')
                         
                         tool_results.append(f"Tool '{tool_name}' result: {result}")
                     except Exception as e:
@@ -370,6 +471,7 @@ Available tools: get_stock_price, check_condition, request_email_alert, get_comp
         final_response = response.content
         if tool_results:
             final_response += "\n\n" + "\n".join(tool_results)
+        print('\n\n 🌟🌟🌟 Final_result = ', tool_results)
         
         return {
             "messages": [AIMessage(content=final_response)],
@@ -419,9 +521,13 @@ def create_stock_monitoring_graph():
     workflow.add_node("check_confirmations", check_confirmations_node)
     
     # Add edges
-    workflow.add_edge(START, "agent")
-    workflow.add_conditional_edges("agent", should_continue)
-    workflow.add_conditional_edges("check_confirmations", confirmation_routing)
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue,
+        {"check_confirmations": "check_confirmations", END: END}
+    )
+    workflow.add_conditional_edges("check_confirmations", confirmation_routing,
+        {"agent": "agent", END: END}
+    )
     
     # Add memory for persistence
     memory = MemorySaver()
@@ -435,14 +541,14 @@ class StockMonitoringAgent:
     def __init__(self):
         self.graph = create_stock_monitoring_graph()
     
-    def create_session(self, user_id: str = None) -> str:
+    def create_session(self, session_id: Optional[str] = None, user_id: str = None) -> str:
         """Create a new user session"""
-        return session_manager.create_session(user_id)
+        return session_manager.create_session(session_id, user_id)
     
     def run(self, user_input: str, session_id: str, thread_id: str = None):
         """Run the agent with session context"""
         if not thread_id:
-            thread_id = f"thread_{session_id}_{uuid.uuid4().hex[:8]}"
+            thread_id = session_id
         
         config = {"configurable": {"thread_id": thread_id}}
         
@@ -526,9 +632,9 @@ class StockMonitoringAgent:
 stock_agent = StockMonitoringAgent()
 
 # ✅ Convenience Functions for External Usage
-def create_new_session(user_id: str = None) -> str:
+def create_new_session(session_id: Optional[str] = None, user_id: str = None) -> str:
     """Create a new session - convenience function"""
-    return stock_agent.create_session(user_id)
+    return stock_agent.create_session(session_id, user_id)
 
 def run_stock_query(user_input: str, session_id: str) -> Dict[str, Any]:
     """Run a stock query - convenience function"""
@@ -551,11 +657,15 @@ def test_agent():
     session_id = create_new_session("test_user")
     print(f"📝 Session: {session_id}")
     
-    test_queries = [
-        "Get Apple stock price",
-        "Check if Google stock is below $120", 
-        "Monitor Tesla stock, check if it's above $200, and send alert to test@gmail.com"
-    ]
+    #test_queries = [
+    #     "Get Apple stock price",
+    #     "Check if Google stock is below $120", 
+    #     "Monitor Tesla stock, check if it's above $200, and send alert to test@gmail.com"
+    # ]
+    
+    test_queries = ["Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250. Use these tools = 'fetch_price.py', 'check_condition.py', 'notify.py' "]
+    #test_queries = ["Fetch Tesla stock price and send me an email at himunagapure114@gmail.com, when it goes above $250. Required tools = 'fetch_price.py', 'check_condition.py', 'notify.py' "]
+
     
     for i, query in enumerate(test_queries, 1):
         print(f"\n🚀 Test {i}: {query}")
@@ -570,6 +680,7 @@ def test_agent():
                 if hasattr(msg, 'content'):
                     print(f"📋 {msg.content}")
         
+        print("🌟🌟Checking for pending confirmations...")
         confirmations = get_pending_confirmations(session_id)
         if confirmations:
             print(f"\n📧 Pending confirmations: {len(confirmations)}")
