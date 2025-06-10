@@ -2,22 +2,17 @@
 
 import os
 import uuid
-import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Literal
 from dataclasses import dataclass, asdict
 import yfinance as yf
-import importlib.util
-import sys
-from pathlib import Path
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import Tool
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict, Annotated
 
 from tools.get_stock_price import fetch_stock_price
@@ -26,12 +21,14 @@ from tools.request_email_alert import send_email_alert
 from tools.get_company_ceo import get_company_ceo
 from tools.get_company_financials import get_company_financials
 
+from tool_registry import load_dynamic_tools
+
 # ✅ Configure Gemini
 #genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 try:
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",  # Try stable model
+        model="gemini-2.0-flash",  # Try stable model
         temperature=0.2,
         max_tokens=500,
         google_api_key=os.getenv("GOOGLE_API_KEY"),  # Explicit API key
@@ -275,73 +272,6 @@ def get_financials_tool(symbol: str) -> str:
     except Exception as e:
         return f"❌ Error getting financials for {symbol}: {str(e)}"
 
-#Add dynamic tools to list of tools
-def load_dynamic_tools() -> List[Tool]:
-    """Load dynamic tools from tool_registry.json"""
-    dynamic_tools = []
-    
-    try:
-        # Load tool registry
-        registry_path = Path("tool_registry.json")
-        if not registry_path.exists():
-            print("⚠️ tool_registry.json not found, skipping dynamic tools")
-            return dynamic_tools
-        
-        with open(registry_path, 'r') as f:
-            registry = json.load(f)
-        
-        for tool_info in registry.get('tools', []):
-            try:
-                # Import the dynamic tool module
-                tool_path = Path(tool_info['filepath'])
-                if not tool_path.exists():
-                    print(f"⚠️ Tool file not found: {tool_path}")
-                    continue
-                
-                # Load module dynamically
-                spec = importlib.util.spec_from_file_location(
-                    tool_info['name'], 
-                    tool_path
-                )
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[tool_info['name']] = module
-                spec.loader.exec_module(module)
-                
-                # Look for main function (usually the tool name or 'main')
-                main_func = None
-                possible_func_names = [
-                    tool_info['name'],
-                    'main',
-                    'execute',
-                    'run'
-                ]
-                
-                for func_name in possible_func_names:
-                    if hasattr(module, func_name):
-                        main_func = getattr(module, func_name)
-                        break
-                
-                if main_func:
-                    # Create Tool wrapper
-                    tool = Tool(
-                        name=tool_info['name'],
-                        func=main_func,
-                        description=tool_info['description']
-                    )
-                    dynamic_tools.append(tool)
-                    print(f"✅ Loaded dynamic tool: {tool_info['name']}")
-                else:
-                    print(f"⚠️ No main function found for tool: {tool_info['name']}")
-                    
-            except Exception as e:
-                print(f"❌ Error loading tool {tool_info['name']}: {str(e)}")
-                continue
-    
-    except Exception as e:
-        print(f"❌ Error loading tool registry: {str(e)}")
-    
-    return dynamic_tools
-
 # ✅ LangGraph Tools with Session Context
 def create_session_aware_tools(session_id: str) -> List[Tool]:
     """Create tools that are aware of the current session"""
@@ -379,8 +309,24 @@ def create_session_aware_tools(session_id: str) -> List[Tool]:
     ]
     
     # Load dynamic tools
-    dynamic_tools = load_dynamic_tools()
+    # dynamic_tools = load_dynamic_tools()
+    # print("\n 🌟🚀Dynamic tools = ",dynamic_tools)
+    # print("\n 🌟🚀Static tools = ",static_tools)
     
+    # Load dynamic tools with enhanced error handling
+    try:
+        print("🔄 Loading dynamic tools...")
+        dynamic_tools = load_dynamic_tools()
+        print(f"✅ Successfully loaded {len(dynamic_tools)} dynamic tools")
+        
+        # Debug: Print loaded tool info
+        for tool in dynamic_tools:
+            print(f"   🧰 {tool.name}: {tool.description}")
+            
+    except Exception as e:
+        print(f"❌ Error loading dynamic tools: {str(e)}")
+        dynamic_tools = []
+        
     # Combine static and dynamic tools
     all_tools = static_tools + dynamic_tools
     
@@ -398,11 +344,20 @@ def agent_node(state: AgentState):
     # Create session-aware tools
     tools = create_session_aware_tools(session_id)
     
+    if not tools:
+        return {
+            "messages": [AIMessage(content="❌ No tools available. Please check tool configuration.")],
+            "workflow_complete": True
+        }
+
     # Get tool names for system message
     tool_names = [tool.name for tool in tools]
+    print("\n🚀All Tool Names (inside tool user):", tool_names)
     
     # System message with instructions
     system_msg = SystemMessage(content=f"""You are an intelligent stock monitoring assistant.
+
+Available tools: {', '.join(tool_names)}
 
 CAPABILITIES:
 - Get real-time stock prices
@@ -410,20 +365,22 @@ CAPABILITIES:
 - Request email alerts (requires user confirmation)
 - Get company CEO information
 - Get company financial data
+- Access dynamically loaded tools for specialized tasks
 
 AUTONOMOUS OPERATION GUIDELINES:
 - Analyze the user's request carefully to understand their true intent
-- Keywords like "monitor", "watch", "track", "alert", "notify" all require getting stock price first
+- Always use the most appropriate tool for the task
 - Review all available tools and determine which ones are relevant
+- If a dynamic tool is available for a specific request (like news analysis), prefer it over generic response
 - Design your own workflow to accomplish the user's goals most effectively
 - You have complete freedom to decide the sequence and combination of tools to us
-- Adapt your approach based on what the user is asking for
+- Be creative in combining tools to provide comprehensive answers
 - Think creatively about how to combine tools for complex requests
 Only use tools that are actually needed - don't use unnecessary tools
 
 WORKFLOW GUIDELINES:
 1. Understand the user's request completely
-2. For ANY stock-related request, START with get_stock_price
+2. Use all required tools in correct order
 3. Use tools strategically to gather needed information
 4. For email alerts, use 'request_email_alert' tool - this will create a pending request
 5. Be clear about what actions require confirmation
@@ -431,14 +388,45 @@ WORKFLOW GUIDELINES:
 
 IMPORTANT: Email alerts require user confirmation and will be handled separately.
 
-Available tools: {', '.join(tool_names)}
+Current session: {session_id}
 """)
     
-    # Bind tools to LLM
-    llm_with_tools = llm.bind_tools(tools)
+    # Convert tools to Gemini format
+    formatted_tools = []
+    for tool in tools:
+        tool_schema = {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+        
+        # Get function signature if available
+        if hasattr(tool, 'func'):
+            import inspect
+            sig = inspect.signature(tool.func)
+            for param_name, param in sig.parameters.items():
+                if param_name != 'self':
+                    param_type = str(param.annotation) if param.annotation != inspect.Parameter.empty else "string"
+                    tool_schema["parameters"]["properties"][param_name] = {
+                        "type": "string",
+                        "description": f"Parameter {param_name}"
+                    }
+                    if param.default == inspect.Parameter.empty:
+                        tool_schema["parameters"]["required"].append(param_name)
+        
+        formatted_tools.append(tool_schema)
+    
+    # Bind tools to LLM with proper format
+    llm_with_tools = llm.bind(tools=formatted_tools)
+    
     # Get response from LLM
     response = llm_with_tools.invoke([system_msg] + messages)
     print("\n🌟🌟🌟 response = ", response)
+    print("\n🌟🌟🌟 response.tool_calls = ", response.tool_calls)
     
     # Check if tools need to be called
     if response.tool_calls:
@@ -446,29 +434,42 @@ Available tools: {', '.join(tool_names)}
         tool_results = []
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
+            tool_args = tool_call.get("args", {})
             print(f'\n 🌟🌟🌟 Tool call = {tool_call}, tool name = {tool_name} and tool_args = {tool_args}')
+            
             # Find and execute the tool
             for tool in tools:
                 if tool.name == tool_name:
                     try:
-                        if isinstance(tool_args, dict) and len(tool_args) == 1:
-                            # Single argument
-                            arg_value = list(tool_args.values())[0]
-                            result = tool.func(arg_value)
-                            print(f'\n 🌟 if part : Tool Name = {tool_name}, tool args = {arg_value}, function result = {result}')
+                        # Handle different argument formats
+                        if isinstance(tool_args, dict):
+                            # Remove any empty or None values
+                            tool_args = {k: v for k, v in tool_args.items() if v not in (None, '', {})}
+                            
+                            if not tool_args:
+                                # No arguments provided, call function without args
+                                result = tool.func()
+                            elif len(tool_args) == 1:
+                                # Single argument
+                                arg_value = list(tool_args.values())[0]
+                                result = tool.func(arg_value)
+                            else:
+                                # Multiple arguments
+                                result = tool.func(**tool_args)
                         else:
-                            # Multiple arguments or direct call
-                            result = tool.func(**tool_args if isinstance(tool_args, dict) else tool_args)
-                            print(f'\n 🌟 else part: Tool Name = {tool_name}, tool args = {arg_value}, function result = {result}')
+                            # Direct argument
+                            result = tool.func(tool_args)
                         
+                        print(f'\n 🌟 Tool Name = {tool_name}, tool args = {tool_args}, function result = {result}')
                         tool_results.append(f"Tool '{tool_name}' result: {result}")
                     except Exception as e:
-                        tool_results.append(f"Tool '{tool_name}' error: {str(e)}")
+                        error_msg = f"Tool '{tool_name}' error: {str(e)}"
+                        print(f"❌ {error_msg}")
+                        tool_results.append(error_msg)
                     break
         
         # Create a comprehensive response
-        final_response = response.content
+        final_response = response.content or ""
         if tool_results:
             final_response += "\n\n" + "\n".join(tool_results)
         print('\n\n 🌟🌟🌟 Final_result = ', tool_results)
@@ -657,16 +658,15 @@ def test_agent():
     session_id = create_new_session("test_user")
     print(f"📝 Session: {session_id}")
     
-    #test_queries = [
+    # test_queries = [
     #     "Get Apple stock price",
     #     "Check if Google stock is below $120", 
-    #     "Monitor Tesla stock, check if it's above $200, and send alert to test@gmail.com"
+    #     "Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250. Use these tools = 'fetch_price.py', 'check_condition.py', 'notify.py'"
     # ]
     
-    test_queries = ["Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250. Use these tools = 'fetch_price.py', 'check_condition.py', 'notify.py' "]
-    #test_queries = ["Fetch Tesla stock price and send me an email at himunagapure114@gmail.com, when it goes above $250. Required tools = 'fetch_price.py', 'check_condition.py', 'notify.py' "]
+    #test_queries = ["Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250. Use these tools = 'fetch_price.py', 'check_condition.py', 'notify.py' "]
+    test_queries = ["Analyze sentiment from recent news headlines for Intel (INTC)"]
 
-    
     for i, query in enumerate(test_queries, 1):
         print(f"\n🚀 Test {i}: {query}")
         print("-" * 50)

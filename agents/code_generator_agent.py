@@ -236,7 +236,7 @@ class CodeGeneratorAgent:
             }
         }
         
-        self.tools_directory = "generated_tools"
+        self.tools_directory = "dynamic_tools"
         self.registry_file = "tool_registry.json"
         self._ensure_directories()
     
@@ -248,6 +248,19 @@ class CodeGeneratorAgent:
         if not os.path.exists(self.registry_file):
             with open(self.registry_file, 'w') as f:
                 json.dump({"tools": []}, f)
+                
+        # Ensure the registry file has proper structure
+        try:
+            with open(self.registry_file, 'r') as f:
+                registry = json.load(f)
+                if "tools" not in registry:
+                    registry["tools"] = []
+                    with open(self.registry_file, 'w') as f:
+                        json.dump(registry, f, indent=2)
+        except (json.JSONDecodeError, KeyError):
+            # If file is corrupted, recreate it
+            with open(self.registry_file, 'w') as f:
+                json.dump({"tools": []}, f, indent=2)
     
     def detect_api_requirements(self, user_request: str) -> List[str]:
         """Detect which APIs are needed and validate they're sufficient."""
@@ -348,13 +361,19 @@ class CodeGeneratorAgent:
                 # Confirm user wants to proceed
                 proceed = input("\nDo you want to proceed with these API limitations? (y/n): ").strip().lower()
                 if proceed != 'y':
-                    return {
-                        "status": "cancelled",
-                        "message": "Tool creation cancelled due to API limitations."
-                    }
+                    proceed_next = input("\nDo you want to enter your API keys? (y/n): ").strip().upper()
+                    if proceed_next == 'y':
+                        user_api_key = input("\nEnter API Keys: ").strip().lower()
+                        print("\n---Logic for entering User API key pending---\n")
+                    else:
+                        return {
+                            "status": "cancelled",
+                            "message": "Tool creation cancelled due to API limitations."
+                        }
             
             # Generate code only after all validations pass
             generated_code, detected_apis = self.generate_tool_code(user_request, detected_apis)
+            print('\n 🌟🌟 Generated code : \n', generated_code)
             
             # Extract function name
             function_name = self.extract_function_name(generated_code)
@@ -430,6 +449,15 @@ STRICT REQUIREMENTS:
 5. Return structured data with clear success/error status
 6. Include appropriate financial disclaimers
 
+CRITICAL FUNCTION DESIGN REQUIREMENTS:
+1. Functions must be fully self-contained and runnable without unnecessary parameters
+2. All API keys must be retrieved using os.getenv() INSIDE the function
+3. NO function parameters for API keys or configuration
+4. Functions should have minimal or no parameters (only essential business logic parameters)
+5. All required data (API keys, credentials) must be auto-injected from environment variables
+6. It should only have parameters specified in user_request. Example: user_request = "Analyze sentiment from recent news headlines specifically about Intel (INTC)" 
+then generated function definition should be like "def intc_news_sentiment(stock_name)" Here stock name = "INTC" is parameter from user_request
+
 CRITICAL ANTI-SIMULATION REQUIREMENTS:
 1. NEVER create simulated/fake/placeholder data
 2. NEVER use hardcoded values as substitutes for real API data
@@ -441,6 +469,8 @@ Available APIs (ONLY use these):
 {api_info}
 
 Create a single, complete function that:
+- Is fully self-contained and requires NO external parameters for API keys
+- Retrieves all API keys using os.getenv() inside the function
 - Handles all specified requirements within API limitations
 - Includes proper input validation
 - Has comprehensive error handling
@@ -448,6 +478,7 @@ Create a single, complete function that:
 - Includes rate limiting awareness
 - Has detailed docstring with limitations
 - NEVER simulates or creates fake data
+- Can be executed immediately with only required parameter passing
 
 Do NOT:
 - Create placeholder implementations for missing APIs
@@ -474,6 +505,9 @@ Format as complete Python code with imports and example usage.
             elif "```" in generated_code:
                 generated_code = generated_code.split("```")[1].strip()
             
+            # Inject API key retrieval inside functions
+            generated_code = self._inject_api_key_retrieval(generated_code, detected_apis)
+
             # POST-GENERATION VALIDATION: Check for simulation patterns
             simulation_patterns = [
                 'simulated_price', 'fake_price', 'mock_price', 'placeholder',
@@ -483,12 +517,47 @@ Format as complete Python code with imports and example usage.
             for pattern in simulation_patterns:
                 if pattern in generated_code.lower():
                     raise Exception(f"Generated code contains simulation pattern: '{pattern}'. Real API implementation required.")
-                    
+            
             return generated_code, detected_apis
             
         except Exception as e:
             raise Exception(f"Error generating code: {str(e)}")
     
+    def _inject_api_key_retrieval(self, code: str, detected_apis: List[str]) -> str:
+        """Ensure API keys are retrieved inside functions instead of passed as parameters."""
+        
+        # Remove api_key parameters from function definitions
+        code = re.sub(r'def\s+(\w+)\s*\([^)]*api_key[^)]*\)', 
+                    lambda m: m.group(0).replace('api_key, ', '').replace(', api_key', '').replace('api_key', ''), 
+                    code)
+        
+        # Find function definitions and inject API key retrieval at the beginning
+        for api in detected_apis:
+            if api in self.available_apis and self.available_apis[api]['requires_key']:
+                key_name = self.available_apis[api]['key_name']
+                
+                if isinstance(key_name, list):
+                    # Multiple keys needed
+                    key_retrievals = []
+                    for key in key_name:
+                        key_retrievals.append(f"    {key.lower().replace('_', '_')} = os.getenv('{key}')")
+                        key_retrievals.append(f"    if not {key.lower().replace('_', '_')}:")
+                        key_retrievals.append(f"        return {{'status': 'error', 'message': 'Missing {key} environment variable'}}")
+                    key_injection = '\n'.join(key_retrievals)
+                else:
+                    # Single key needed
+                    var_name = key_name.lower().replace('_key', '').replace('_', '_') + '_key'
+                    key_injection = f"""    {var_name} = os.getenv('{key_name}')
+        if not {var_name}:
+            return {{'status': 'error', 'message': 'Missing {key_name} environment variable'}}"""
+                
+                # Inject after function definition
+                pattern = r'(def\s+\w+\s*\([^)]*\):\s*\n\s*"""[^"]*"""\s*\n)'
+                replacement = f'\\1\n{key_injection}\n'
+                code = re.sub(pattern, replacement, code, flags=re.DOTALL)
+        
+        return code
+
     def _check_api_keys(self, apis: List[str]) -> List[str]:
         """Check which required API keys are missing."""
         missing_keys = []
@@ -561,31 +630,57 @@ from dotenv import load_dotenv
 load_dotenv()
 
 '''
-        
+        #saves in dynamic_tools directory
         with open(filepath, 'w') as f:
             f.write(header + standardized_code)
         
+        #saves in tool_registry.json 
         self._update_registry(function_name, filename, description, apis_used)
+        # Debug: Verify registry was updated
+        try:
+            with open(self.registry_file, 'r') as f:
+                registry = json.load(f)
+                print(f"📊 Registry now contains {len(registry.get('tools', []))} tools")
+        except Exception as e:
+            print(f"⚠️  Could not verify registry update: {e}")
+        
         return filepath
     
     def _update_registry(self, function_name: str, filename: str, description: str, apis_used: List[str]):
         """Update the tool registry."""
-        with open(self.registry_file, 'r') as f:
-            registry = json.load(f)
-        
-        tool_info = {
-            "name": function_name,
-            "filename": filename,
-            "description": description,
-            "apis_used": apis_used,
-            "created_at": datetime.now().isoformat(),
-            "filepath": os.path.join(self.tools_directory, filename)
-        }
-        
-        registry["tools"].append(tool_info)
-        
-        with open(self.registry_file, 'w') as f:
-            json.dump(registry, f, indent=2)
+        try:
+            if not os.path.exists(self.registry_file):
+                registry = {"tools": []}
+            else:
+                with open(self.registry_file, 'r') as f:
+                    try:
+                        registry = json.load(f)
+                        if "tools" not in registry:
+                            registry["tools"] = []
+                    except json.JSONDecodeError:
+                        registry = {"tools": []}
+            
+            tool_info = {
+                "name": function_name,
+                "filename": filename,
+                "description": description,
+                "apis_used": apis_used,
+                "created_at": datetime.now().isoformat(),
+                "filepath": os.path.join(self.tools_directory, filename)
+            }
+            
+            #filepath = os.path.join(self.tools_directory, filename)
+            registry["tools"].append(tool_info)
+            
+            with open(self.registry_file, 'w') as f:
+                json.dump(registry, f, indent=2)
+                
+            print(f"✅ Tool registered successfully in {self.registry_file}")
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to update registry: {str(e)}")
+            print(f"Registry file: {self.registry_file}")
+            print(f"Current directory: {os.getcwd()}")
     
     def list_available_apis(self):
         """Display comprehensive API information."""
@@ -642,10 +737,10 @@ def main():
             print("\n📖 USAGE GUIDELINES:")
             print("\n✅ REQUESTS THAT WILL BE ACCEPTED:")
             print("- 'Get current stock price for Apple' (uses yfinance)")
-            print("- 'Fetch financial news for a company' (uses newsapi)")
-            print("- 'Calculate moving averages for a stock' (uses yfinance)")
-            print("- 'Send email alert when stock hits price target' (uses yfinance + email)")
-            print("- 'Create a tool that gets stock price for a stock and latest news for it and sends summary via email'") #Multiple API Requirements
+            print("- 'Fetch financial news for a company INTC and give summary' (uses newsapi)")
+            print("- 'Calculate moving averages for a stock INTC' (uses yfinance)")
+            print("- 'Send email alert to himunagapure114@gmail.com when stock TSLA hits price above 100' (uses yfinance + email)")
+            print("- 'Create a tool that gets stock price for a stock LMND and latest news for it and sends summary via email to himunagapure114@gmail.com '") #Multiple API Requirements
             
             print("\n❌ REQUESTS THAT WILL BE REJECTED: Unclear request")
             print("- 'Create a simple portfolio tracker'") #doesn't work

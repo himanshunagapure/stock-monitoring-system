@@ -6,14 +6,13 @@ from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.tools import Tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode
 
 # Import agents
-from agent.agent3 import StockMonitoringAgent
-from agent.code_generator_agent2 import CodeGeneratorAgent
+from agents.stock_monitoring_agent import StockMonitoringAgent
+from agents.code_generator_agent import CodeGeneratorAgent
 
 # Initialize LLM
 llm = ChatGoogleGenerativeAI(
@@ -62,8 +61,9 @@ Available Tool Categories:
 
 Analyze the query and list ALL tools needed to fulfill it completely.
 Do NOT list tools that don't exist or aren't mentioned above.
-List tools in a simple format, one per line, with just the filename (e.g. 'fetch_price.py').
+List tools in a simple format, one per line, with just the filename (e.g. 'get_stock_price.py').
 Do not use numbers, backticks, or any other formatting.
+If all Tools are not available to fulfill the request completely give response as "New Tool Needed"
 """)
     
     # Get tool analysis from LLM
@@ -85,36 +85,43 @@ Do not use numbers, backticks, or any other formatting.
         if "__" not in tool_path:
             existing_tools.add(os.path.basename(tool_path))
     
-    # Extract required tools from LLM response
-    required_tools = []
-    for line in response.content.split("\n"):
-        if ".py" in line:
-            # Clean up the tool name by removing numbers, backticks, and extra spaces
-            tool_name = line.split(".py")[0].strip()
-            tool_name = ''.join(c for c in tool_name if not c.isdigit() and c != '`' and c != '.')
-            tool_name = tool_name.strip() + ".py"
-            required_tools.append(tool_name)
-    
-    # Determine missing tools
-    missing_tools = [tool for tool in required_tools if tool not in existing_tools]
-    
+    # Check if LLM response indicates new tool is needed
+    response_content = response.content.strip().lower()
+    if "new tool needed" in response_content:
+        print("🛠️⚒️⚒️ LLM indicates new tool is needed")
+        required_tools = []
+    else:
+        # Extract required tools from LLM response
+        required_tools = []
+        for line in response.content.split("\n"):
+            if ".py" in line:
+                # Clean up the tool name by removing numbers, backticks, and extra spaces
+                tool_name = line.split(".py")[0].strip()
+                tool_name = ''.join(c for c in tool_name if not c.isdigit() and c != '`' and c != '.')
+                tool_name = tool_name.strip() + ".py"
+                required_tools.append(tool_name)
+        
     print(f"📋 Required tools: {required_tools}")
-    if missing_tools:
-        print(f"❌ Missing tools: {missing_tools}")
+    # Check if required_tools is empty
+    if not required_tools:
+        print("❌ No required tools identified")
         next_agent = "tool_creator"
     else:
         print("✅ All required tools are available")
         next_agent = "stock_monitor"
     
     # Add analysis result to messages
-    analysis_msg = AIMessage(content=f"Tool Analysis:\nRequired tools: {required_tools}\nMissing tools: {missing_tools}")
+    if "new tool needed" in response_content:
+        analysis_msg = AIMessage(content=f"Tool Analysis: New tool creation required for query: {query}")
+    else:
+        analysis_msg = AIMessage(content=f"Tool Analysis:\nRequired tools: {required_tools}")
     
     return {
         "messages": state["messages"] + [analysis_msg],
         "session_id": state["session_id"],
         "user_query": query,
         "required_tools": required_tools,
-        "missing_tools": missing_tools,
+        "missing_tools": [],
         "generated_tools": [],
         "workflow_complete": False,
         "next_agent": next_agent
@@ -122,31 +129,28 @@ Do not use numbers, backticks, or any other formatting.
 
 # Tool Creator Node
 def tool_creator(state: AgentState) -> AgentState:
-    """Generates missing tools using code_generator_agent."""
-    if not state["missing_tools"]:
-        return {**state, "next_agent": "stock_monitor"}
-    
-    print("\n🛠️ Tool Creator generating missing tools...")
+    """Generates tools using code_generator_agent based on user query."""
+    print("\n🛠️ Tool Creator generating tools...")
     
     # Initialize code generator agent
     code_gen = CodeGeneratorAgent()
     generated_tools = []
     generation_messages = []
     
-    # Generate each missing tool
-    for tool in state["missing_tools"]:
-        print(f"\n📝 Generating tool: {tool}")
-        result = code_gen.create_tool(
-            f"Create a tool named {tool} that can handle this query: {state['user_query']}"
-        )
-        
-        if result["status"] == "success":
-            generated_tools.append(tool)
-            generation_messages.append(AIMessage(content=f"✅ Generated tool: {tool}"))
-            print(f"✅ Generated {tool} successfully")
-        else:
-            generation_messages.append(AIMessage(content=f"❌ Failed to generate {tool}: {result['message']}"))
-            print(f"❌ Failed to generate {tool}: {result['message']}")
+    # Generate tool based on user query
+    print(f"\n📝 Generating tool for query: {state['user_query']}")
+    result = code_gen.create_tool(
+        f"Create a tool that can handle this query: {state['user_query']}"
+    )
+    print('🌟🌟🌟Result from Tool Creator = ', result)
+    if result["status"] == "success":
+        tool_name = result.get('function_name', "custom_tool.py")
+        generated_tools.append(tool_name)
+        generation_messages.append(AIMessage(content=f"✅ Generated tool: {tool_name}"))
+        print(f"✅ Generated {tool_name} successfully")
+    else:
+        generation_messages.append(AIMessage(content=f"❌ Failed to generate tool: {result['message']}"))
+        print(f"❌ Failed to generate tool: {result['message']}")
     
     return {
         **state,
@@ -172,8 +176,15 @@ def stock_monitor(state: AgentState) -> AgentState:
         print(f"📝 Created new session: {session_id}")
     
     # Build new user_query message
-    tools_list = "', '".join(tool.replace(".py", "") for tool in state['required_tools'])
-    user_query = f"{state['user_query']}. Use all these tools : '{tools_list}'"
+    tools_list_req = "', '".join(tool.replace(".py", "") for tool in state['required_tools'])
+    tools_list_gen = "', '".join(tool.replace(".py", "") for tool in state['generated_tools'])
+    
+    if tools_list_gen:
+        use_these_tools = tools_list_gen
+    else:
+        use_these_tools = tools_list_req
+
+    user_query = f"{state['user_query']}. Use all these tools : '{use_these_tools}'"
     
     # Execute query
     result = stock_agent.run(user_query, session_id)
@@ -305,14 +316,14 @@ if __name__ == "__main__":
     print("🤖 Testing Multi-Agent System")
     print("=" * 60)
     
-    #test_queries = [
-    #     "Get the current price of Apple stock",
-    #     "Monitor Tesla stock and send me an email when it goes above $250",
-    #     "Analyze sentiment from current news headlines for a stock INTC"
-    # ]
     test_queries = [
-        "Fetch Tesla stock price and send me an email to himunagapure114@gmail.com when it goes above $250"
+        "Get the current price of Apple stock",
+        "Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250",
+        "Fetch top 5 current news headlines for a stock INTC"
     ]
+    # test_queries = [
+    #     "Monitor Tesla stock and send me an email at himunagapure114@gmail.com, when it goes above $250"
+    # ]
     
     for query in test_queries:
         print(f"\n🚀 Testing query: {query}")
